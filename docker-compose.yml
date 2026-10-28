@@ -1,0 +1,212 @@
+name: rutasur
+
+# Imagen unica con todos los servicios Node. Cada contenedor corre un proceso distinto.
+x-servicio: &servicio
+  image: rutasur-services:latest
+  build:
+    context: .
+    dockerfile: services/Dockerfile
+  restart: unless-stopped
+  environment: &entorno
+    KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+    MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/rutasur?replicaSet=rs0}
+    MONGO_DB: ${MONGO_DB:-rutasur}
+    SIM_SPEEDUP: ${SIM_SPEEDUP:-120}
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    TZ: UTC
+  depends_on:
+    kafka-init:
+      condition: service_completed_successfully
+    mongo-init:
+      condition: service_completed_successfully
+
+services:
+  # ---------------------------------------------------------------- Kafka (KRaft)
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: rutasur-kafka
+    restart: unless-stopped
+    ports:
+      - "${KAFKA_EXTERNAL_PORT:-29092}:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: CONTROLLER://:9093,PLAINTEXT://:9092,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:${KAFKA_EXTERNAL_PORT:-29092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 72
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  # Crea los seis topics con sus particiones y politicas de retencion.
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: rutasur-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        K=/opt/kafka/bin/kafka-topics.sh
+        B=kafka:9092
+        $$K --bootstrap-server $$B --create --if-not-exists --topic envios.estados \
+          --partitions 3 --replication-factor 1 --config retention.ms=2592000000
+        $$K --bootstrap-server $$B --create --if-not-exists --topic envios.promesas \
+          --partitions 3 --replication-factor 1 --config cleanup.policy=compact
+        $$K --bootstrap-server $$B --create --if-not-exists --topic envios.reprogramaciones \
+          --partitions 3 --replication-factor 1 --config retention.ms=2592000000
+        $$K --bootstrap-server $$B --create --if-not-exists --topic alertas.sla \
+          --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        $$K --bootstrap-server $$B --create --if-not-exists --topic notificaciones.enviadas \
+          --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        $$K --bootstrap-server $$B --create --if-not-exists --topic envios.estados.dlq \
+          --partitions 3 --replication-factor 1 --config retention.ms=2592000000
+        echo "Topics creados:"
+        $$K --bootstrap-server $$B --list
+
+  # ---------------------------------------------------------------- MongoDB (replica set de 1 nodo)
+  mongo:
+    image: mongo:7
+    container_name: rutasur-mongo
+    restart: unless-stopped
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "${MONGO_PORT:-27018}:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.adminCommand('ping').ok\" >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  # Inicia el replica set (necesario para change streams) y espera al primario.
+  mongo-init:
+    image: mongo:7
+    container_name: rutasur-mongo-init
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mongosh --host mongo:27017 --quiet --eval \
+          'try { rs.status() } catch (e) { rs.initiate({_id:"rs0",members:[{_id:0,host:"mongo:27017"}]}) }'
+        echo "Esperando primario..."
+        until mongosh "mongodb://mongo:27017/rutasur?replicaSet=rs0" --quiet --eval 'db.hello().isWritablePrimary' | grep -q true; do
+          sleep 1
+        done
+        echo "Replica set listo."
+
+  # ---------------------------------------------------------------- Servicios de aplicacion
+  proyector:
+    <<: *servicio
+    container_name: rutasur-proyector
+    command: ["node", "proyector/index.js"]
+
+  notificaciones:
+    <<: *servicio
+    container_name: rutasur-notificaciones
+    command: ["node", "notificaciones/index.js"]
+
+  reprogramacion:
+    <<: *servicio
+    container_name: rutasur-reprogramacion
+    command: ["node", "reprogramacion/index.js"]
+
+  monitor-sla:
+    <<: *servicio
+    container_name: rutasur-monitor-sla
+    command: ["node", "monitor-sla/index.js"]
+    environment:
+      <<: *entorno
+      SLA_TICK_MS: ${SLA_TICK_MS:-60000}
+
+  analitica:
+    <<: *servicio
+    container_name: rutasur-analitica
+    command: ["node", "analitica/index.js"]
+
+  analitica-replay:
+    <<: *servicio
+    container_name: rutasur-analitica-replay
+    command: ["node", "analitica-replay/index.js"]
+
+  simulador:
+    <<: *servicio
+    container_name: rutasur-simulador
+    command: ["node", "simulator/index.js"]
+    ports:
+      - "${SIMULADOR_PORT:-4000}:4000"
+    environment:
+      <<: *entorno
+      PORT: "4000"
+      SIM_SHIPMENTS_PER_MINUTE: ${SIM_SHIPMENTS_PER_MINUTE:-20}
+      SIM_SEED: ${SIM_SEED:-42}
+      SIM_HUB_DELAY_PROB: ${SIM_HUB_DELAY_PROB:-0.10}
+      SIM_DUPLICADO_PROB: ${SIM_DUPLICADO_PROB:-0.02}
+      SIM_DESORDEN_PROB: ${SIM_DESORDEN_PROB:-0.02}
+      SIM_MALFORMADO_PROB: ${SIM_MALFORMADO_PROB:-0.01}
+      SIM_EXPRESS_PROB: ${SIM_EXPRESS_PROB:-0.15}
+      SIM_PROMISE_HORAS: ${SIM_PROMISE_HORAS:-24}
+
+  # Panel de control de la demo: opera contenedores y offsets de Kafka.
+  control:
+    <<: *servicio
+    container_name: rutasur-control
+    command: ["node", "control/index.js"]
+    ports:
+      - "${CONTROL_PORT:-4100}:4100"
+    environment:
+      <<: *entorno
+      PORT: "4100"
+      COMPOSE_PROJECT: rutasur
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # ---------------------------------------------------------------- Frontend
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    image: rutasur-web:latest
+    container_name: rutasur-web
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    environment:
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/rutasur?replicaSet=rs0}
+      MONGO_DB: ${MONGO_DB:-rutasur}
+      SIMULADOR_URL: http://simulador:4000
+      CONTROL_URL: http://control:4100
+      NEXT_TELEMETRY_DISABLED: "1"
+      TZ: UTC
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+      control:
+        condition: service_started
+      simulador:
+        condition: service_started
+
+volumes:
+  mongo-data:
